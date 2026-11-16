@@ -1,5 +1,8 @@
 # Stage 1: Build the local Go/uTLS ClientHello bridge
 FROM golang:1.24-alpine AS tls-bridge
+# proxy.golang.org is unreachable from some networks (e.g. mainland China);
+# pin a reachable mirror so `go build` does not hang on module download.
+ENV GOPROXY=https://goproxy.cn,direct
 WORKDIR /src
 COPY tools/wb-tls-bridge/go.mod tools/wb-tls-bridge/go.sum* tools/wb-tls-bridge/main.go ./
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /wb-tls-bridge .

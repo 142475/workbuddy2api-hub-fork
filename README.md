@@ -262,6 +262,9 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 ## 七、版本更新记录 (Changelog)
 
 本版更新与完整历史版本请查阅 **[docs/CHANGELOG.md](docs/CHANGELOG.md)**。
+### Unreleased
+
+- **构建：固定 Go 模块代理**：`Dockerfile` 第一阶段显式设置 `ENV GOPROXY=https://goproxy.cn,direct`，避免在无法直连 `proxy.golang.org` 的网络（如中国大陆）里 `go build` 卡在模块下载直到 `i/o timeout`。 / **Build: pinned Go module proxy**: the first stage of `Dockerfile` now sets `ENV GOPROXY=https://goproxy.cn,direct`, so `go build` no longer stalls on module downloads in networks that cannot reach `proxy.golang.org` (e.g. mainland China).
 ### v2.1.3
 
 - **运营活动与成长任务补全**：新增星巴克协作、记者节福利活动，接入任务读取、`viewed`、事件上报、`claim` 与 `claimed_at` 回读；技能分享改为创建真实分享渠道并确认进度后领奖；模板任务按服务端场景逐组上报四事件。手机 App 对话任务只提示、不伪造。
