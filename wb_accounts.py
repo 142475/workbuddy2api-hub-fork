@@ -814,13 +814,6 @@ DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
 # 账号一旦命中就持久化为禁用，只有操作者在面板手动启用才重新入池。
 RESTRICTED_ACCOUNT_COOLDOWN = 0.0
 
-# 临期积分优先的权重放大系数。_expiry_weight() 算出的乘积（紧迫度 × 剩余量，
-# 约 1.0–5.5）乘上它再取整，让相邻档位之间留出足够的分辨率：不放大时
-# round() 会把一整段天数压成同一个整数，权重就失去区分度（实测生产池 110 个
-# 账号权重全部相同，退化成纯轮询）。取 10 表示最急的账号大约拿到最不急的
-# 5 倍流量，而不是独占。
-EXPIRY_WEIGHT_SCALE = 10.0
-
 
 def _exponential_backoff(count, base, cap, offset):
     """base * 2 ** (count - offset), clamped to cap and to 20 steps."""
@@ -1648,43 +1641,6 @@ class Account(object):
             if soonest is None or days < soonest:
                 soonest = float(days)
         return soonest
-
-    def soonest_expiring_remain(self):
-        """How many credits the soonest-lapsing package still holds.
-
-        The companion of `soonest_expiring_days()`: that one says *when* the
-        first package lapses, this one says *how much* is still unspent in it.
-        Both come from the same package, so the weight in `_expiry_weight()`
-        multiplies urgency by the amount actually at risk of being wasted.
-
-        None when nothing can be said - no credit data, no package with a
-        usable remainder, or no end date - which keeps an unjudgeable account
-        on weight 1 instead of guessing.
-        """
-        credits = self.credits
-        if not isinstance(credits, dict):
-            return None
-        soonest = None
-        remain_of_soonest = None
-        for package in (credits.get("packages") or []):
-            if not isinstance(package, dict):
-                continue
-            if package.get("no_expiry"):
-                continue
-            if package.get("package_code") == "enterprise":
-                continue
-            if package.get("is_expired"):
-                continue
-            days = package.get("days_left")
-            remain = package.get("remain")
-            if not isinstance(days, (int, float)) or days < 0:
-                continue
-            if not isinstance(remain, (int, float)) or remain <= 0:
-                continue
-            if soonest is None or days < soonest:
-                soonest = float(days)
-                remain_of_soonest = float(remain)
-        return remain_of_soonest
 
     def in_expiring_window(self):
         """True when this account should jump the dispatch queue.
@@ -4476,16 +4432,12 @@ class AccountPool(object):
         self._login_slot_reserved = set()
         self._lock = threading.RLock()
         self._cursor = 0
-        # Smooth weighted round-robin state for the expiring-credits window,
-        # keyed by uid (see _weighted_pick). Runtime-only: a restart just
-        # restarts the rotation.
-        self._expiry_weights = {}
         # 剩余用量优先调度：wb_proxy 每请求推来的 {(uid, model): 权重}（只有它
         # 读得到剩余估算）。空表 = 不启用——开关关着、或没有任何组合接近估计
         # 限额——选择就是原来的纯轮询。纯派生值，不落盘。
         self._remaining_weights = {}
-        # 这条偏好自己的平滑加权轮询累计值，键是 (uid, model)：与临期的
-        # _expiry_weights 分开，两个偏好各自记各自的轮次。
+        # 这条偏好自己的平滑加权轮询累计值，键是 (uid, model)：与手动权重的
+        # _manual_weights 分开，两个偏好各自记各自的轮次。
         self._remaining_pick_state = {}
         # 手动权重优先（面板按账号设置，weight > 1 才生效）的平滑加权轮询
         # 累计值，键是 uid：与前两条偏好各自的轮次分开。派生值，不落盘。
@@ -5251,69 +5203,39 @@ class AccountPool(object):
         return self._smooth_weighted_pick(ready, "_manual_weights")
 
     def _pick_expiring_first(self, snapshot, exclude, model):
-        """Serve the in-window accounts first, or None when none can.
+        """把请求交给到期最近的那个账号，或 None（窗口内没人可用）。
 
-        Within the window the pick is a weighted round-robin: an account's
-        share grows the closer its credits are to lapsing, but no account is
-        ever handed the whole window. A strict soonest-first order would put
-        every request on the one account expiring tomorrow until the upstream
-        rate-limited it, which is exactly the burst this spreads out; weighting
-        keeps the preference while giving the accounts expiring later a real
-        share. Accounts that lapse on the same day carry the same weight, so
-        they keep taking turns.
+        严格按到期日升序，不做加权：`soonest_expiring_days()` 最短的账号一直
+        接单，直到它自己不可用（冷却、达限额、被排除，或者那个包耗光、下一个
+        包把它推远）。之前按「紧迫度 × 剩余量」加权轮询，窗口里到期更晚的账号
+        照样分走一大半流量，那与「把快作废的积分先花掉」正好相反。
+
+        到期日完全相同的账号并列第一、轮流接单：它们之间没有任何可比较的
+        信息，硬钉住其中一个就等于把所有请求压在一个号上。剩余量不参与排序，
+        否则剩 300 的会把剩 10 的饿死，而「还剩多少」本就不是这条偏好的判据。
         """
-        urgent = [a for a in snapshot if a.in_expiring_window()]
+        urgent = []
+        for account in snapshot:
+            if account.uid in exclude:
+                continue
+            if not account.in_expiring_window():
+                continue
+            if not account.ready(model=model):
+                continue
+            days = account.soonest_expiring_days()
+            if days is None:
+                continue
+            # 保留一位小数再比：上游的 days_left 是「快照时刻到到期时刻」的
+            # 浮点差，同一天到期的号实测会有 2.71 / 2.74 这种毫厘之差，按原值
+            # 严格比较会把它们拆成两个档位，同一天到期的轮转就没了。
+            urgent.append((round(float(days), 1), account))
         if not urgent:
             return None
-        ready = [a for a in urgent if a.uid not in exclude and a.ready(model=model)]
-        if not ready:
-            return None
-        return self._weighted_pick(ready)
-
-    def _expiry_weight(self, account):
-        """How much of the window's traffic this account should take.
-
-        Two factors, multiplied, floored at 1 so an account at the far edge of
-        the window still gets served rather than starved until the others run
-        dry:
-
-          * urgency - how close the soonest-lapsing package is. Kept as a
-            fraction of the window rather than a rounded day count, because
-            rounding collapsed the whole 0-1.4 day range onto one weight and
-            that is exactly where a real pool sits: on the live pool 110 of
-            112 accounts reported days_left 0.10 and every one of them got the
-            same weight, so the preference degraded into a plain rotation.
-
-          * amount - how much of the lapsing package is still unspent. This is
-            the part that actually gets "spent before it expires": an account
-            holding 30 expiring credits is worth 30x the traffic of one holding
-            1, and the old weight ignored the figure entirely. Logarithmic, so
-            a 30-vs-1 gap does not turn into a 30x share that starves everyone
-            else, and floored at 1 so a nearly-spent package still counts.
-
-        A pool where nobody can be judged keeps the plain rotation: an unknown
-        soonest-expiring day yields weight 1, and equal weights degenerate to
-        a plain rotation in `_smooth_weighted_pick`.
-        """
-        try:
-            window = float(account.expiring_window_days or 0)
-        except (TypeError, ValueError):
-            window = 0.0
-        days = account.soonest_expiring_days()
-        if days is None:
-            return 1
-        # urgency: 1 at the far edge of the window, growing to ~1+1/scale at 0
-        if window <= 0:
-            return 1
-        remaining_fraction = max(0.0, min(1.0, 1.0 - (float(days) / window)))
-        urgency = 1.0 + remaining_fraction
-        # amount: log-scaled so 30 credits is not a 30x share of the traffic
-        amount = account.soonest_expiring_remain()
-        if amount is None or amount <= 0:
-            amount_weight = 1.0
-        else:
-            amount_weight = 1.0 + math.log10(1.0 + float(amount))
-        return max(1, int(round(urgency * amount_weight * EXPIRY_WEIGHT_SCALE)))
+        soonest = min(days for days, _account in urgent)
+        rivals = [account for days, account in urgent if days == soonest]
+        if len(rivals) == 1:
+            return rivals[0]
+        return self._rotate_pick(rivals, exclude, model, cursor_key="__expiry_ties__")
 
     def _pick_remaining_first(self, snapshot, exclude, model):
         """剩余估算接近耗尽的 (账号, 模型) 优先接单，或 None（没有可交的）。
@@ -5346,12 +5268,6 @@ class AccountPool(object):
             [(account, (account.uid, model), weight) for account, weight in ready],
             "_remaining_pick_state",
             keep_uids=set(a.uid for a in snapshot))
-
-    def _weighted_pick(self, ready):
-        """临期积分那条的入口：在窗口内的账号之间平滑加权轮询。"""
-        return self._smooth_weighted_pick(
-            [(account, account.uid, self._expiry_weight(account))
-             for account in ready], "_expiry_weights")
 
     def _smooth_weighted_pick(self, entries, state_name, keep_uids=None):
         """Smooth weighted round-robin over (account, key, weight) triples.

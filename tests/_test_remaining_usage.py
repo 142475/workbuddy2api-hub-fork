@@ -1502,7 +1502,10 @@ class RemainingPriorityTests(unittest.TestCase):
     def test_the_expiring_window_still_wins_over_the_remaining_weights(self):
         # 层序：临期积分那条先跑，它在窗口里有人可交时剩余权重不参与。
         urgent = account("acct-A")
+        # 两处一起打桩：算法先看 in_expiring_window()，再按 soonest_expiring_days()
+        # 排序，只桩前者会让它被当成「判不了到期日」跳过，落到剩余权重那一层。
         urgent.in_expiring_window = lambda: True
+        urgent.soonest_expiring_days = lambda: 1.0
         pool = self._pool([urgent, account("acct-B")],
                           weights={("acct-B", MODEL): 4})
         picked = {pool.pick(realm="intl", model=MODEL).uid for _ in range(4)}
