@@ -252,7 +252,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 307 个套件：230 个 Python + 77 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 308 个套件：230 个 Python + 78 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - `tests/_visual_recent.py` 是同一类手动检查器：用合成 fixture 起一份 1480 宽的「请求列表」，验证失败徽章点开的详情弹窗、四个过滤下拉真的把参数发到 `/usage/recent`，并把列表 / 弹窗 / 筛选条截图写到系统临时目录的 `wb-visual-recent/`。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
@@ -266,6 +266,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 - **构建：固定 Go 模块代理**：`Dockerfile` 第一阶段显式设置 `ENV GOPROXY=https://goproxy.cn,direct`，避免在无法直连 `proxy.golang.org` 的网络（如中国大陆）里 `go build` 卡在模块下载直到 `i/o timeout`。 / **Build: pinned Go module proxy**: the first stage of `Dockerfile` now sets `ENV GOPROXY=https://goproxy.cn,direct`, so `go build` no longer stalls on module downloads in networks that cannot reach `proxy.golang.org` (e.g. mainland China).
 - **签到与每日活跃的失败补救**：国际版建会话间歇性回 401 / code 10034（API key 未能解析）时不再直接判失败，改为可重试；国内版签到失败后在本轮内就地补试两次（间隔 60 秒），不再把当天的 100 积分拖到次日过期。 / **Failure recovery for check-in and daily activity**: an intermittent 401 / code 10034 from the intl conversation-creation call is retryable now instead of an immediate failure, and a failed CN check-in is retried twice in the same cycle (60s apart) instead of waiting for the next round and losing the 100 credits.
+- **面板「今日活跃 / 加油站」以时间戳为准**：徽章原来只看当天的活动流水，补签或补跑成功的那一刻如果容器正好重启（时间戳已落盘、流水还没追加），账号明明已经领到仍会显示「失败」。现在先看 `lastCheckin` / `lastDailyChat` 是不是今天，命中一律算已完成；只有当天没有时间戳时才回落到流水去判失败。 / **The activity chip trusts the timestamp**: the badge used to read today's activity rows only, so a success landing just before a container restart (timestamp saved, row not yet appended) kept showing 失败 even though the reward had been claimed. It now checks `lastCheckin` / `lastDailyChat` first and treats today's timestamp as done, falling back to the rows only when there is no timestamp for today.
 ### v2.1.3
 
 - **运营活动与成长任务补全**：新增星巴克协作、记者节福利活动，接入任务读取、`viewed`、事件上报、`claim` 与 `claimed_at` 回读；技能分享改为创建真实分享渠道并确认进度后领奖；模板任务按服务端场景逐组上报四事件。手机 App 对话任务只提示、不伪造。
