@@ -2908,7 +2908,12 @@ class Account(object):
             except Exception:
                 detail = str(exc)
             return None, {"message": "HTTP %d: %s" % (exc.code, detail[:120]),
-                          "retryable": exc.code >= 500 or exc.code in (408, 429),
+                          # 401 也要重试：国际版 CreateConversation 会间歇性回
+                          # code=10034「CODEBUDDY_API_KEY is required but could not be
+                          # resolved」，同一账号几分钟后用同样的头就能成功（2026-11-16
+                          # 实测 3 个账号一早全命中，重试后逐个恢复）。持久封禁走的是
+                          # 403 / 11140，不在这里。
+                          "retryable": exc.code >= 500 or exc.code in (401, 408, 429),
                           "limit": _active_conversation_limit(exc.code, detail)}
         except Exception as exc:
             return None, {"message": str(exc), "retryable": True, "limit": False}

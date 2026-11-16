@@ -90,6 +90,34 @@ def keepalive_due(expires_at, now=None, lead=None):
     return (exp - now) < lead
 
 
+#: 签到失败后本轮内的补救重试次数与间隔。上游签到接口会间歇性回「签到失败，
+#: 请稍后重试」（2026-11-16 09:00 那轮 4 个账号 2 个命中），当天晚些时候同样
+#: 的请求就成功；而当天 100 积分次日过期，干等 21:00 那一轮太晚。
+CHECKIN_RETRY_ROUNDS = 2
+CHECKIN_RETRY_GAP = 60.0
+
+
+def checkin_with_retry(acc, log=None, sleep=None, rounds=None, gap=None):
+    """签到；失败就在本轮内就地补试，返回最后一次回执。
+
+    上游签到接口会间歇性回「签到失败，请稍后重试」——当天晚些时候同样的请求
+    就成功，而当天 100 积分次日过期，干等 21:00 那一轮太晚（2026-11-16 实测
+    09:00 那轮 4 个账号 2 个命中）。已签成或判定不再可签就提前停。
+    """
+    rounds = CHECKIN_RETRY_ROUNDS if rounds is None else rounds
+    gap = CHECKIN_RETRY_GAP if gap is None else gap
+    sleep = time.sleep if sleep is None else sleep
+    res = acc.checkin(trigger="scheduler")
+    for _ in range(rounds):
+        if res.get("ok") or not acc.can_checkin():
+            break
+        if log:
+            log(f"↻ 账号 [{(acc.uid or str(acc))[:8]}] 签到未成功，{int(gap)}s 后重试")
+        sleep(gap)
+        res = acc.checkin(trigger="scheduler")
+    return res
+
+
 class Scheduler:
     def __init__(self, pool):
         self.pool = pool
@@ -488,7 +516,7 @@ class Scheduler:
                 if run_checkin:
                     if acc.can_checkin():
                         self.log(f"检测到国内版账号 [{uid8}] 今日尚未签到，执行自动签到...")
-                        res = acc.checkin(trigger="scheduler")
+                        res = checkin_with_retry(acc, self.log)
                         if res.get("ok"):
                             checkin_count += 1
                             self.log(f"✓ 账号 [{uid8}] 自动签到成功: {res.get('msg')}")
