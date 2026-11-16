@@ -96,6 +96,47 @@ class DueSlotTests(unittest.TestCase):
         self.assertEqual(self.sched._due_daily_chat_slot(at(9, 30)), "")
 
 
+
+class CatchupTests(unittest.TestCase):
+    """固定时段撞上上游故障后，整点补跑把机会从「一天几次」变成「每小时一次」。"""
+
+    def setUp(self):
+        self.acc = mock.MagicMock()
+        self.acc.uid = "u1"
+        self.acc.can_daily_chat.return_value = True
+        self.pool = mock.MagicMock()
+        self.pool.dir = _TMP.name
+        self.pool.accounts = [self.acc]
+        self.sched = wb_scheduler.Scheduler(self.pool)
+        self.sched.log = lambda *a, **k: None
+        self.sched.daily_chat_times = ["07:35"]
+
+    def test_hourly_slot_is_due_while_something_is_pending(self):
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(13, 0)), "补跑 13:00")
+
+    def test_same_hour_is_only_consumed_once(self):
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(13, 0)), "补跑 13:00")
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(13, 3)), "")
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(14, 0)), "补跑 14:00")
+
+    def test_nothing_pending_means_no_catchup(self):
+        self.acc.can_daily_chat.return_value = False
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(13, 0)), "")
+
+    def test_outside_the_window_is_silent(self):
+        # 凌晨不补：上游日额刚重置，补跑只会白打请求。
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(5, 59)), "")
+        # 收工钟点之后也不补。
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(23, 30)), "")
+
+    def test_no_configured_slots_means_no_catchup(self):
+        self.sched.daily_chat_times = []
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(13, 0)), "")
+
+    def test_next_day_resets_the_guard(self):
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(13, 0, day=20)), "补跑 13:00")
+        self.assertEqual(self.sched._due_daily_chat_catchup(at(13, 0, day=21)), "补跑 13:00")
+
 class CycleScopeTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="daily-schedule-cycle-")

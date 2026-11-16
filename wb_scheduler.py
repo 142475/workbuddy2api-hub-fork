@@ -20,6 +20,12 @@ from wb_tasks import do_cat_travel
 #: 网页活跃时段到期后还能补多久（分钟）。两个时段相隔 12 小时，所以 12 小时既覆盖
 #: 「巡检被占住 / 进程重启 / 漏了一次 tick」，又不会把昨天没跑的时段补到今天。
 DAILY_CHAT_SLOT_GRACE_MINUTES = 720
+# 固定时段一天只命中一次：那一轮撞上上游 401/超时（实测 07:33 起连续
+# 两小时报 10034），这个账号当天就再没机会。整点补跑把「一天几次机会」
+# 改成「每小时一次」。凌晨不补——那个点上游日额刚重置，补跑只会白打请求。
+DAILY_CHAT_CATCHUP_FROM_HOUR = 6
+DAILY_CHAT_CATCHUP_UNTIL_HOUR = 23
+DAILY_CHAT_CATCHUP_WINDOW_MINUTES = 5
 #: 批次截止的余量（秒）：每个账号有自己的预算，批次再给一份等待/收尾的余量。
 DAILY_CHAT_BATCH_SLACK = 60
 #: 被放弃的工作线程最多留这么多条。它们通常几十秒内自己结束（每一轮的网络调用
@@ -229,7 +235,8 @@ class Scheduler:
             if self.enabled:
                 # 网页活跃的独立时段是分钟级：先于整点检查，避免整点那次
                 # sleep(65) 把同一分钟的时段跨过去。
-                due_slot = self._due_daily_chat_slot(now)
+                due_slot = (self._due_daily_chat_slot(now)
+                            or self._due_daily_chat_catchup(now))
                 if due_slot:
                     reason = f"网页活跃定时命中 ({due_slot})"
                     try:
@@ -343,6 +350,35 @@ class Scheduler:
             return slot
         return ""
 
+
+    def _due_daily_chat_catchup(self, now=None):
+        """当天还有账号没跑完日活时，整点补跑一次。
+
+        固定时段由 _due_daily_chat_slot 管，一天每个时段只命中一次：那一轮撞上
+        上游 401/超时就再也没机会了。这里按小时另开机会，条件只有两个——还有
+        can_daily_chat() 的账号、且没到收工钟点。账号级判定保证已完成的账号不会
+        被重复请求。
+        """
+        if not self.daily_chat_times or not self.pool:
+            return ""
+        now = time.localtime() if now is None else now
+        if not (DAILY_CHAT_CATCHUP_FROM_HOUR <= now.tm_hour
+                <= DAILY_CHAT_CATCHUP_UNTIL_HOUR):
+            return ""
+        if now.tm_min > DAILY_CHAT_CATCHUP_WINDOW_MINUTES:
+            return ""
+        day = time.strftime("%Y-%m-%d", now)
+        done = self._daily_chat_done.setdefault(day, set())
+        slot = f"补跑 {now.tm_hour:02d}:00"
+        if slot in done:
+            return ""
+        if not [acc for acc in list(self.pool.accounts) if acc.can_daily_chat()]:
+            return ""
+        done.add(slot)
+        for other in list(self._daily_chat_done):
+            if other != day:
+                self._daily_chat_done.pop(other, None)
+        return slot
     def _reload_schedule(self):
         """Re-read the configurable hours; keep the current grid on failure.
 
