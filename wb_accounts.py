@@ -4176,9 +4176,16 @@ class SessionAffinity(object):
 
     The history is small on purpose (`history`, 3): it is a list of accounts
     that may still hold the conversation's prefix, not a load-balancing device.
+
+    The TTL is 12 hours (`ttl`, 43200): a chat turn goes upstream with the whole
+    conversation as the prompt, so serving one conversation from two accounts
+    rebuilds the prompt cache every time the account changes - measured on
+    2026-11-18, that cost far more credits than the expiring balance it was
+    trying to save. Twelve hours is an ordinary working session, long enough
+    that a conversation stops hopping between accounts.
     """
 
-    def __init__(self, ttl=7200, max_entries=5000, history=3):
+    def __init__(self, ttl=43200, max_entries=5000, history=3):
         self.ttl = ttl
         self.max_entries = max_entries
         self.history = max(1, int(history))
@@ -4414,9 +4421,10 @@ class CreditsRefresher(threading.Thread):
 # active_realm.json 是区域开关）。
 # 临期积分与「会话粘性」打架时的分水岭（天）。粘性保住的是 prompt cache
 # 命中率，临期保住的是别让积分作废：只有快到期的积分才值得为它牺牲一次
-# 缓存命中，超过这个范围的绑定账号一律不让位。与面板上的
-# expiring_window_days（默认 7 天，只决定谁进优先队列）不是一回事。
-STICKY_OVERRIDE_DAYS = 2.0
+# 缓存命中，超过这个范围的绑定账号一律不让位。也是「全部流量压给最近到期
+# 那个号」的门槛——24 小时内到期的积分才值得独占（见 `_pick_expiring_first`）。
+# 与面板上的 expiring_window_days（默认 7 天，只决定谁进优先队列）不是一回事。
+STICKY_OVERRIDE_DAYS = 1.0
 
 
 NON_ACCOUNT_FILES = ("settings.json", "active_realm.json")
@@ -4449,10 +4457,9 @@ class AccountPool(object):
         # 手动权重优先（面板按账号设置，weight > 1 才生效）的平滑加权轮询
         # 累计值，键是 uid：与前两条偏好各自的轮次分开。派生值，不落盘。
         self._manual_weights = {}
-        # 临期积分并行的平滑加权轮询累计值，键是 uid：权重是每个号每小时
-        # 必须花掉多少积分（见 _expiry_need），与手动权重、剩余用量各自记
-        # 各自的轮次。派生值，不落盘。
-        self._expiring_pick_state = {}
+        # 「都还早」时按到期日反比分配的平滑加权轮询累计值，键是 uid：与
+        # 手动权重、剩余用量各自记各自的轮次。派生值，不落盘。
+        self._expiry_spread_state = {}
         # 页内轮转（超限对话）的每页游标，键是 (页号, 页大小)；整池轮转仍用
         # _cursor，两条轮转互不挪动对方的位置。派生值，不落盘。
         self._page_cursors = {}
@@ -5133,7 +5140,7 @@ class AccountPool(object):
                 if scope is not None and not wb_pool_scope.in_scope(account, scope):
                     account = None
                 if account and account.realm == realm and account.ready(model=model):
-                    # 绑定的账号不再无脑优先：它若没在 48 小时内到期，而池里
+                    # 绑定的账号不再无脑优先：它若没在 24 小时内到期，而池里
                     # 有更近、且快到期的账号可用，就让位——快到期的积分比
                     # 一次缓存命中更值钱（见 _urgent_credits_beat）。
                     if self._urgent_credits_beat(account, realm, exclude, model,
@@ -5157,13 +5164,14 @@ class AccountPool(object):
         return account
 
     def _urgent_credits_beat(self, bound, realm, exclude, model, allowed, scope):
-        """这个绑定账号该被一个 48 小时内到期的账号顶掉吗。
+        """这个绑定账号该被一个 24 小时内到期的账号顶掉吗。
 
         会话粘性保住的是 prompt cache，只有快到期的积分值得为它牺牲一次缓存
         命中。判断独立于 `expiring_window_days`（那条只管谁进优先队列，默认
-        7 天，比这里的 48 小时宽得多）：存在「可用、到期更近、剩余不超过
+        7 天，比这里的 24 小时宽得多）：存在「可用、到期更近、剩余不超过
         STICKY_OVERRIDE_DAYS 天」的账号时返回 True，调用方据此中断粘性、
-        落到池级偏好（临期优先）上重新选号。
+        落到池级偏好（临期优先）上重新选号，并把绑定改到新号——抢只抢一次，
+        之后 12 小时内这个对话稳定在新号上。
         """
         mine = None
         try:
@@ -5262,23 +5270,25 @@ class AccountPool(object):
         return self._smooth_weighted_pick(ready, "_manual_weights")
 
     def _pick_expiring_first(self, snapshot, exclude, model):
-        """把请求交给窗口内「最需要马上花掉积分」的账号，或 None（无人可用）。
+        """窗口内选号，或 None（窗口内没人可用）。
 
-        窗口内的账号**一起**接单，按各自的每小时候需求分流量，不再排队独占。
-        独占的问题在排队本身：最近到期的号在前面吃着，后面那号的包在排队期间
-        就到点了。实测（2026-11-18，8788 四个启用号）未来 48 小时到期的 476 分
-        里有约 260 分（55%）是这样作废的——不是花不掉，是轮不到它花。
+        按「还剩多久到期」分两档，因为要保的东西不同：
 
-        权重是 `_expiry_need()`：该号每个窗口内积分包的 `remain ÷ 剩余小时`
-        之和，也就是「每小时得花掉多少才不至于作废」。它由**到期有多急**决定，
-        不是「还剩多少」：剩 300 分但十天后到期的号权重照样低，剩 10 分明天
-        到期的号权重照样高。没有到期信息（`soonest_expiring_days()` 为 None）
-        的号不参与——看不懂的数据不该被当成偏好。
+        - **24 小时内到期**（≤ `STICKY_OVERRIDE_DAYS`）：积分马上就要作废，
+          全部流量压给到期最近的那个号，独占才来得及花完；同一档（一位小数
+          后到期日相同）内部轮转。
+        - **都还早**（> 24 小时）：没有作废压力，按到期日反比加权——最近的
+          拿大部分，其余账号分一小部分（权重 = 1 ÷ 剩余天数，2 天 vs 6 天
+          = 3:1）。窗口内的号都参与，免得所有会话都压在一个号上。
 
-        这一层取代了原来的「到期日升序 + 同档轮转」（commit 930376f）。同档
-        同量的号 need 相同、权重相同，平滑加权轮询退化成轮转，行为与原来一致。
+        这一层只决定「这个请求交给谁」；同一个对话会不会换号由上面的会话
+        粘性管着（12 小时内回同一个号，prompt cache 命中）。换成并行分流量
+        （commit c64d5ca）实测的代价就在这里：同一对话每轮换号，每轮都要
+        重建 prompt cache，省下的临期积分还不够多付的缓存钱。
+
+        `soonest_expiring_days()` 为 None 的号不参与——判不了到期日就不猜。
         """
-        entries = []
+        urgent = []
         for account in snapshot:
             if account.uid in exclude:
                 continue
@@ -5286,58 +5296,30 @@ class AccountPool(object):
                 continue
             if not account.ready(model=model):
                 continue
-            if account.soonest_expiring_days() is None:
-                continue
-            need = self._expiry_need(account)
-            # 平滑加权轮询只认相对比例，缩放是为了让 need 的小数差体现出来：
-            # ×10 后 1.65 分/小时 与 0.24 分/小时 是 17:2 而不是 2:1。
-            weight = max(1, min(10000, int(round(need * 10))))
-            entries.append((account, account.uid, weight))
-        if not entries:
-            return None
-        if len(entries) == 1:
-            return entries[0][0]
-        return self._smooth_weighted_pick(entries, "_expiring_pick_state")
-
-    def _expiry_need(self, account):
-        """这个账号每小时得花掉多少积分，才不至于让窗口内的包过期作废。
-
-        按包算 `remain ÷ (days_left × 24)` 再求和：0.7 天的包只剩十几个小时，
-        它的每小时候需求自然很高，这正是要加速的对象。期限不足一小时按一小时
-        算，避免除出无穷大把权重撑爆。
-
-        窗口外的包不计：期限还宽，不该抢走临期包急于花掉的流量。已过期、
-        无剩余、无到期日、标记了 no_expiry（免费包/体验版，抵扣截止在几年后）
-        的包都跳过——它们没有「快作废」这件事。
-        """
-        try:
-            packages = (account.credits or {}).get("packages") or []
-        except AttributeError:
-            return 0.0
-        try:
-            window = float(account.expiring_window_days or 0)
-        except (TypeError, ValueError):
-            window = 0.0
-        need = 0.0
-        for package in packages:
-            if not isinstance(package, dict):
-                continue
-            if package.get("no_expiry") or package.get("is_expired"):
-                continue
-            days = package.get("days_left")
+            days = account.soonest_expiring_days()
             if days is None:
                 continue
-            try:
-                remain = float(package.get("remain") or 0)
-                days = float(days)
-            except (TypeError, ValueError):
-                continue
-            if remain <= 0 or days < 0:
-                continue
-            if window > 0 and days > window:
-                continue
-            need += remain / max(days * 24.0, 1.0)
-        return need
+            # 保留一位小数再比：上游的 days_left 是「快照时刻到到期时刻」的
+            # 浮点差，同一天到期的号实测会有 2.71 / 2.74 这种毫厘之差，按原值
+            # 严格比较会把它们拆成两个档位，同一天到期的轮转就没了。
+            urgent.append((round(float(days), 1), account))
+        if not urgent:
+            return None
+        soonest = min(days for days, _account in urgent)
+        if soonest <= STICKY_OVERRIDE_DAYS:
+            rivals = [account for days, account in urgent if days == soonest]
+            if len(rivals) == 1:
+                return rivals[0]
+            return self._rotate_pick(rivals, exclude, model, cursor_key="__expiry_ties__")
+        entries = []
+        for days, account in urgent:
+            # 到期日反比：1 天 vs 6 天 = 6:1。×100 取整是为了让 1.3 / 1.6
+            # 这种小数差体现出来（77:62 而不是被压成 1:1）。
+            weight = max(1, min(10000, int(round(100.0 / max(days, 0.1)))))
+            entries.append((account, account.uid, weight))
+        if len(entries) == 1:
+            return entries[0][0]
+        return self._smooth_weighted_pick(entries, "_expiry_spread_state")
 
     def _pick_remaining_first(self, snapshot, exclude, model):
         """剩余估算接近耗尽的 (账号, 模型) 优先接单，或 None（没有可交的）。

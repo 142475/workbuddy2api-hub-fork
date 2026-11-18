@@ -309,7 +309,7 @@ class SessionAffinityTests(unittest.TestCase):
         return pool
 
     def test_a_bound_session_keeps_its_account(self):
-        # 会话亲和优先：绑定账号没在 48 小时内到期时，临期账号抢不走它
+        # 会话亲和优先：绑定账号没在 24 小时内到期时，临期账号抢不走它
         # （soon 还有 3 天，超出 STICKY_OVERRIDE_DAYS）。
         bound = make_account("bound", credits=credits(40))
         soon = make_account("bound-soon", credits=credits(3))
@@ -319,8 +319,13 @@ class SessionAffinityTests(unittest.TestCase):
             self.assertEqual(
                 pool.pick_for_session(realm="cn", session_key="s1").uid, "bound")
 
-    def test_a_bound_session_yields_to_credits_expiring_within_48_hours(self):
-        # 48 小时内到期就不必再顾粘性：切过去把那笔积分先花掉，绑定随之改到新号。
+    def test_the_binding_lasts_twelve_hours(self):
+        # 12 小时（43200 秒）内同一个对话回同一个号，prompt cache 才有意义。
+        self.assertEqual(wb_accounts.SessionAffinity().ttl, 43200)
+        self.assertEqual(self._pool([make_account("ttl-a")]).affinity.ttl, 43200)
+
+    def test_a_bound_session_yields_to_credits_expiring_within_24_hours(self):
+        # 24 小时内到期就不必再顾粘性：切过去把那笔积分先花掉，绑定随之改到新号。
         bound = make_account("bound", credits=credits(40))
         soon = make_account("bound-soon", credits=credits(1))
         pool = self._pool([bound, soon])
@@ -570,12 +575,9 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(results), 8 * 200)
         counts = Counter(results)
-        # 临期并行：每个号按「每小时得花掉多少」分流量。最早到期的拿最大
-        # 份额，但后来者不再是零流量——它们的包同样会在排队中过期。
-        self.assertEqual(len(counts), 8, "窗口内每个号都该分到流量")
-        self.assertEqual(max(counts, key=counts.get), "c00", "到期最近的仍拿最大份额")
-        self.assertGreater(counts["c00"], counts["c01"])
-        self.assertLess(counts["c07"], counts["c00"] // 5)
+        # 严格按到期日：最早到期的那个吃掉全部流量，并发下也不能分给别人。
+        self.assertEqual(counts["c00"], 8 * 200)
+        self.assertEqual(counts["c07"], 0)
 
     def test_concurrent_fetches_on_one_account_do_not_interleave(self):
         account = make_account("one")
@@ -603,53 +605,64 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(overlaps, [], "两个取数同时进行说明锁没生效")
 
 
-class ExpiringParallelTests(unittest.TestCase):
-    """窗内并行：每个号按「每小时得花掉多少」分流量，不再排队独占。
+class StrictExpiryOrderTests(unittest.TestCase):
+    """24 小时内到期 → 独占；都还早 → 按到期日反比分配。
 
-    独占（commit 930376f 的行为）的问题在排队本身：最近到期的号在前面吃着，
-    后面那号的包在排队期间就到点了。实测（2026-11-18，8788 四个启用号）未来
-    48 小时到期的 476 分里约 260 分（55%）是这样作废的——不是花不掉，是轮
-    不到它花。所以窗口内的号一起接单，权重 = 各包 `remain ÷ 剩余小时` 之和。
+    要求原文：积分到期时间小于 24 小时就把全部请求打到临期最近的账号；都
+    大于 24 小时就加权，大部分打到临期最近的、一部分打到其他账号。剩余积分
+    始终不参与排序——积分多少与谁先到期无关。
     """
 
     def _pool(self, accounts, window=7):
-        directory = tempfile.mkdtemp(prefix="expiry-parallel-")
+        directory = tempfile.mkdtemp(prefix="expiry-strict-")
         pool = wb_accounts.AccountPool(directory, log=lambda _m: None)
         pool.accounts = accounts
         pool.apply_expiring_window({"global": window, "intl": window, "cn": window})
         return pool
 
-    def test_the_sooner_account_takes_most_of_the_flow(self):
-        # 1 天 vs 6 天到期、都是 100 分：前者 need 4.17 分/小时、后者 0.69，
-        # 所以前者拿大头；后者仍有流量，因为它的包同样会过期。
+    def test_a_credit_expiring_within_24h_takes_everything(self):
+        # 1 天后到期 vs 6 天后到期：全部给前者，后者一条不拿。
         sooner = make_account("sooner-s", credits=credits(1))
         later = make_account("later-s", credits=credits(6))
         pool = self._pool([sooner, later])
-        picked = Counter(pool.pick(realm="cn").uid for _ in range(60))
-        self.assertGreater(picked["sooner-s"], picked["later-s"] * 3)
-        self.assertGreater(picked["later-s"], 0, "到期更晚的号也要分到流量")
+        picked = [pool.pick(realm="cn").uid for _ in range(60)]
+        self.assertEqual(picked.count("sooner-s"), 60)
+        self.assertEqual(picked.count("later-s"), 0)
 
-    def test_the_weight_follows_the_urgency_not_the_balance(self):
-        # 同一天到期、剩余量差 30 倍：剩得多的每小时候需求更高，因此拿更多；
-        # 但剩得少的不许饿死——它那 10 分一样会作废。
+    def test_beyond_24h_the_nearest_takes_most_but_not_all(self):
+        # 2 天 vs 6 天：权重 1/2 : 1/6 = 3:1 → 最近的那档拿约 75%，但没有独占。
+        near = make_account("near-x", credits=credits(2))
+        far = make_account("far-x", credits=credits(6))
+        pool = self._pool([near, far])
+        picks = Counter(pool.pick(realm="cn").uid for _ in range(200))
+        self.assertEqual(picks["near-x"] + picks["far-x"], 200)
+        self.assertGreater(picks["near-x"], picks["far-x"] * 2,
+                           "都还早时最近到期的号该拿大部分")
+        self.assertGreater(picks["far-x"], 0,
+                           "都还早时不独占，其余账号也要分到一部分")
+
+    def test_the_switch_sits_at_24_hours(self):
+        # 1.0 天（=24h）独占，1.1 天就落回分配。
+        inside = self._pool([make_account("in-a", credits=credits(1.0)),
+                             make_account("in-b", credits=credits(1.1))])
+        self.assertEqual(
+            {inside.pick(realm="cn").uid for _ in range(30)}, {"in-a"})
+        outside = self._pool([make_account("out-a", credits=credits(1.1)),
+                              make_account("out-b", credits=credits(1.2))])
+        self.assertEqual(
+            {outside.pick(realm="cn").uid for _ in range(60)}, {"out-a", "out-b"})
+
+    def test_remaining_credits_do_not_reorder_the_queue(self):
+        # 同一天到期、剩余量差 30 倍：份额仍然均分，剩余量不参与排序。
         big = make_account("big-s", credits=credits(2, remain=300))
         small = make_account("small-s", credits=credits(2, remain=10))
         pool = self._pool([big, small])
         picks = Counter(pool.pick(realm="cn").uid for _ in range(200))
-        self.assertEqual(len(picks), 2, "两个号都得有流量")
-        self.assertGreater(picks["big-s"], picks["small-s"])
+        self.assertEqual(len(picks), 2, "同一天到期就轮流，不能因为剩余少就饿死")
+        self.assertLessEqual(abs(picks["big-s"] - picks["small-s"]), 2)
 
-    def test_equal_need_still_takes_turns(self):
-        # need 相同的号之间必须轮流：硬钉住其中一个等于把流量压在一个号上。
-        first = make_account("tie-a", credits=credits(2))
-        second = make_account("tie-b", credits=credits(2))
-        pool = self._pool([first, second])
-        picked = [pool.pick(realm="cn").uid for _ in range(6)]
-        self.assertEqual(sorted(set(picked)), ["tie-a", "tie-b"])
-        self.assertLessEqual(abs(picked.count("tie-a") - picked.count("tie-b")), 2)
-
-    def test_a_pool_that_lapses_together_still_spreads(self):
-        # 生产池实测形态：一堆账号 days_left 都是 0.10，剩余量 10~19 分。
+    def test_a_pool_that_lapses_together_still_rotates(self):
+        # 生产池实测形态：一堆账号 days_left 都是 0.10 → 同一档，轮流。
         accounts = [
             make_account("same-%02d" % i, credits=credits(0.1, remain=10 + i))
             for i in range(10)
@@ -657,50 +670,14 @@ class ExpiringParallelTests(unittest.TestCase):
         pool = self._pool(accounts)
         picks = Counter(pool.pick(realm="cn").uid for _ in range(600))
         self.assertEqual(len(picks), 10, "每个账号都该分到流量")
-        self.assertLessEqual(max(picks.values()) - min(picks.values()), 60)
+        shares = sorted(picks.values())
+        self.assertLessEqual(shares[-1] - shares[0], 20, "同档账号之间应接近均分")
 
-    def test_the_linear_weighting_helpers_are_gone(self):
-        # 旧的「紧迫度 × 剩余量」线性加权实现已删，别留死代码；现在按每小时
-        # 候需求加权，入口是 _expiry_need。
+    def test_the_weighting_helpers_are_gone(self):
+        # 加权实现已整体删除，别留死代码给以后的人误用。
         pool = self._pool([make_account("gone-w")])
         self.assertFalse(hasattr(pool, "_expiry_weight"))
         self.assertFalse(hasattr(pool, "_expiry_weights"))
-        self.assertTrue(hasattr(pool, "_expiry_need"))
-
-
-class ExpiryNeedTests(unittest.TestCase):
-    """`_expiry_need`：这个号每小时得花掉多少分。"""
-
-    def _need(self, account, window=7):
-        # 账号必须真的进池：expiring_window_days 是 apply_expiring_window 发给
-        # 池内每个号的，脱离池的号这一项还是 0，窗口就退化成「什么都算」。
-        directory = tempfile.mkdtemp(prefix="expiry-need-")
-        pool = wb_accounts.AccountPool(directory, log=lambda _m: None)
-        pool.accounts = [account]
-        pool.apply_expiring_window({"global": window, "intl": window, "cn": window})
-        return pool._expiry_need(account)
-
-    def test_it_sums_every_package_in_the_window(self):
-        account = make_account("n1", credits=credits(0.5, 2, remain=100))
-        # 100 / (0.5×24) + 100 / (2×24) = 8.33 + 2.08
-        self.assertAlmostEqual(self._need(account), 10.42, delta=0.05)
-
-    def test_packages_outside_the_window_do_not_count(self):
-        account = make_account("n2", credits=credits(1, 40, remain=100))
-        self.assertAlmostEqual(self._need(account), 100 / 24.0, delta=0.05)
-
-    def test_expired_and_no_expiry_packages_are_skipped(self):
-        account = make_account("n3", credits=credits(-1, None, remain=100))
-        self.assertEqual(self._need(account), 0.0)
-
-    def test_unknown_credits_are_zero(self):
-        self.assertEqual(self._need(make_account("n4")), 0.0)
-        self.assertEqual(self._need(make_account("n4b", credits={})), 0.0)
-
-    def test_a_package_under_an_hour_does_not_blow_up(self):
-        # 0.01 天 ≈ 14 分钟，按 1 小时兜底，不能除出无穷大。
-        account = make_account("n5", credits=credits(0.01, remain=100))
-        self.assertAlmostEqual(self._need(account), 100.0, delta=1.0)
         self.assertFalse(hasattr(wb_accounts.Account, "soonest_expiring_remain"))
 
 
