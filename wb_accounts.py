@@ -4412,6 +4412,13 @@ class CreditsRefresher(threading.Thread):
 # 和账号凭证放在同一个目录、但本身不是账号的文件。跳过它们，免得每次启动
 # 都被当成「损坏的账号」解析并打一条 error 日志（settings.json 是面板设置，
 # active_realm.json 是区域开关）。
+# 临期积分与「会话粘性」打架时的分水岭（天）。粘性保住的是 prompt cache
+# 命中率，临期保住的是别让积分作废：只有快到期的积分才值得为它牺牲一次
+# 缓存命中，超过这个范围的绑定账号一律不让位。与面板上的
+# expiring_window_days（默认 7 天，只决定谁进优先队列）不是一回事。
+STICKY_OVERRIDE_DAYS = 2.0
+
+
 NON_ACCOUNT_FILES = ("settings.json", "active_realm.json")
 
 
@@ -5122,6 +5129,12 @@ class AccountPool(object):
                 if scope is not None and not wb_pool_scope.in_scope(account, scope):
                     account = None
                 if account and account.realm == realm and account.ready(model=model):
+                    # 绑定的账号不再无脑优先：它若没在 48 小时内到期，而池里
+                    # 有更近、且快到期的账号可用，就让位——快到期的积分比
+                    # 一次缓存命中更值钱（见 _urgent_credits_beat）。
+                    if self._urgent_credits_beat(account, realm, exclude, model,
+                                                 allowed, scope):
+                        break
                     self.affinity.bind(session_key, uid)
                     return account
         account = self.pick(realm=realm, exclude=exclude, model=model,
@@ -5138,6 +5151,48 @@ class AccountPool(object):
         if account and session_key and (page is None or whole_pool_page):
             self.affinity.bind(session_key, account.uid)
         return account
+
+    def _urgent_credits_beat(self, bound, realm, exclude, model, allowed, scope):
+        """这个绑定账号该被一个 48 小时内到期的账号顶掉吗。
+
+        会话粘性保住的是 prompt cache，只有快到期的积分值得为它牺牲一次缓存
+        命中。判断独立于 `expiring_window_days`（那条只管谁进优先队列，默认
+        7 天，比这里的 48 小时宽得多）：存在「可用、到期更近、剩余不超过
+        STICKY_OVERRIDE_DAYS 天」的账号时返回 True，调用方据此中断粘性、
+        落到池级偏好（临期优先）上重新选号。
+        """
+        mine = None
+        try:
+            mine = bound.soonest_expiring_days()
+        except Exception:
+            mine = None
+        if mine is None:
+            # 绑定号自己算不出到期日（企业额度、免费包、快照还没到），判不了
+            # 就不猜：保持粘性，别为了一个不确定的理由丢掉缓存命中。
+            return False
+        mine = round(float(mine), 1)
+        with self._lock:
+            candidates = [a for a in self.accounts if not realm or a.realm == realm]
+        for candidate in candidates:
+            if candidate.uid == bound.uid or candidate.uid in exclude:
+                continue
+            if allowed is not None and candidate.uid not in allowed:
+                continue
+            if scope is not None and not wb_pool_scope.in_scope(candidate, scope):
+                continue
+            days = candidate.soonest_expiring_days()
+            if days is None:
+                continue
+            days = round(float(days), 1)
+            if days > STICKY_OVERRIDE_DAYS:
+                continue
+            # 绑定账号自己更近（或一样近）时不动：本来就在花那笔积分。
+            if mine is not None and days >= mine:
+                continue
+            if not candidate.ready(model=model):
+                continue
+            return True
+        return False
 
     def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None,
              scope=None):

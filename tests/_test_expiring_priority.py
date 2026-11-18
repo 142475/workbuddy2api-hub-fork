@@ -309,12 +309,33 @@ class SessionAffinityTests(unittest.TestCase):
         return pool
 
     def test_a_bound_session_keeps_its_account(self):
-        # 会话亲和优先：已经绑定的账号不会被临期账号抢走。
+        # 会话亲和优先：绑定账号没在 48 小时内到期时，临期账号抢不走它
+        # （soon 还有 3 天，超出 STICKY_OVERRIDE_DAYS）。
+        bound = make_account("bound", credits=credits(40))
+        soon = make_account("bound-soon", credits=credits(3))
+        pool = self._pool([bound, soon])
+        pool.affinity.bind("s1", "bound")
+        for _ in range(4):
+            self.assertEqual(
+                pool.pick_for_session(realm="cn", session_key="s1").uid, "bound")
+
+    def test_a_bound_session_yields_to_credits_expiring_within_48_hours(self):
+        # 48 小时内到期就不必再顾粘性：切过去把那笔积分先花掉，绑定随之改到新号。
         bound = make_account("bound", credits=credits(40))
         soon = make_account("bound-soon", credits=credits(1))
         pool = self._pool([bound, soon])
         pool.affinity.bind("s1", "bound")
-        for _ in range(4):
+        self.assertEqual(
+            pool.pick_for_session(realm="cn", session_key="s1").uid, "bound-soon")
+        self.assertEqual(pool.affinity.get("s1"), "bound-soon")
+
+    def test_a_bound_account_that_is_itself_urgent_is_kept(self):
+        # 绑定号自己就快到期的，本来就在花那笔积分，不该来回跳。
+        bound = make_account("bound", credits=credits(1))
+        other = make_account("other-soon", credits=credits(1.6))
+        pool = self._pool([bound, other])
+        pool.affinity.bind("s1", "bound")
+        for _ in range(3):
             self.assertEqual(
                 pool.pick_for_session(realm="cn", session_key="s1").uid, "bound")
 
