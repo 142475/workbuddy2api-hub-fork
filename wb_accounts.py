@@ -4449,6 +4449,10 @@ class AccountPool(object):
         # 手动权重优先（面板按账号设置，weight > 1 才生效）的平滑加权轮询
         # 累计值，键是 uid：与前两条偏好各自的轮次分开。派生值，不落盘。
         self._manual_weights = {}
+        # 临期积分并行的平滑加权轮询累计值，键是 uid：权重是每个号每小时
+        # 必须花掉多少积分（见 _expiry_need），与手动权重、剩余用量各自记
+        # 各自的轮次。派生值，不落盘。
+        self._expiring_pick_state = {}
         # 页内轮转（超限对话）的每页游标，键是 (页号, 页大小)；整池轮转仍用
         # _cursor，两条轮转互不挪动对方的位置。派生值，不落盘。
         self._page_cursors = {}
@@ -5258,18 +5262,23 @@ class AccountPool(object):
         return self._smooth_weighted_pick(ready, "_manual_weights")
 
     def _pick_expiring_first(self, snapshot, exclude, model):
-        """把请求交给到期最近的那个账号，或 None（窗口内没人可用）。
+        """把请求交给窗口内「最需要马上花掉积分」的账号，或 None（无人可用）。
 
-        严格按到期日升序，不做加权：`soonest_expiring_days()` 最短的账号一直
-        接单，直到它自己不可用（冷却、达限额、被排除，或者那个包耗光、下一个
-        包把它推远）。之前按「紧迫度 × 剩余量」加权轮询，窗口里到期更晚的账号
-        照样分走一大半流量，那与「把快作废的积分先花掉」正好相反。
+        窗口内的账号**一起**接单，按各自的每小时候需求分流量，不再排队独占。
+        独占的问题在排队本身：最近到期的号在前面吃着，后面那号的包在排队期间
+        就到点了。实测（2026-11-18，8788 四个启用号）未来 48 小时到期的 476 分
+        里有约 260 分（55%）是这样作废的——不是花不掉，是轮不到它花。
 
-        到期日完全相同的账号并列第一、轮流接单：它们之间没有任何可比较的
-        信息，硬钉住其中一个就等于把所有请求压在一个号上。剩余量不参与排序，
-        否则剩 300 的会把剩 10 的饿死，而「还剩多少」本就不是这条偏好的判据。
+        权重是 `_expiry_need()`：该号每个窗口内积分包的 `remain ÷ 剩余小时`
+        之和，也就是「每小时得花掉多少才不至于作废」。它由**到期有多急**决定，
+        不是「还剩多少」：剩 300 分但十天后到期的号权重照样低，剩 10 分明天
+        到期的号权重照样高。没有到期信息（`soonest_expiring_days()` 为 None）
+        的号不参与——看不懂的数据不该被当成偏好。
+
+        这一层取代了原来的「到期日升序 + 同档轮转」（commit 930376f）。同档
+        同量的号 need 相同、权重相同，平滑加权轮询退化成轮转，行为与原来一致。
         """
-        urgent = []
+        entries = []
         for account in snapshot:
             if account.uid in exclude:
                 continue
@@ -5277,20 +5286,58 @@ class AccountPool(object):
                 continue
             if not account.ready(model=model):
                 continue
-            days = account.soonest_expiring_days()
+            if account.soonest_expiring_days() is None:
+                continue
+            need = self._expiry_need(account)
+            # 平滑加权轮询只认相对比例，缩放是为了让 need 的小数差体现出来：
+            # ×10 后 1.65 分/小时 与 0.24 分/小时 是 17:2 而不是 2:1。
+            weight = max(1, min(10000, int(round(need * 10))))
+            entries.append((account, account.uid, weight))
+        if not entries:
+            return None
+        if len(entries) == 1:
+            return entries[0][0]
+        return self._smooth_weighted_pick(entries, "_expiring_pick_state")
+
+    def _expiry_need(self, account):
+        """这个账号每小时得花掉多少积分，才不至于让窗口内的包过期作废。
+
+        按包算 `remain ÷ (days_left × 24)` 再求和：0.7 天的包只剩十几个小时，
+        它的每小时候需求自然很高，这正是要加速的对象。期限不足一小时按一小时
+        算，避免除出无穷大把权重撑爆。
+
+        窗口外的包不计：期限还宽，不该抢走临期包急于花掉的流量。已过期、
+        无剩余、无到期日、标记了 no_expiry（免费包/体验版，抵扣截止在几年后）
+        的包都跳过——它们没有「快作废」这件事。
+        """
+        try:
+            packages = (account.credits or {}).get("packages") or []
+        except AttributeError:
+            return 0.0
+        try:
+            window = float(account.expiring_window_days or 0)
+        except (TypeError, ValueError):
+            window = 0.0
+        need = 0.0
+        for package in packages:
+            if not isinstance(package, dict):
+                continue
+            if package.get("no_expiry") or package.get("is_expired"):
+                continue
+            days = package.get("days_left")
             if days is None:
                 continue
-            # 保留一位小数再比：上游的 days_left 是「快照时刻到到期时刻」的
-            # 浮点差，同一天到期的号实测会有 2.71 / 2.74 这种毫厘之差，按原值
-            # 严格比较会把它们拆成两个档位，同一天到期的轮转就没了。
-            urgent.append((round(float(days), 1), account))
-        if not urgent:
-            return None
-        soonest = min(days for days, _account in urgent)
-        rivals = [account for days, account in urgent if days == soonest]
-        if len(rivals) == 1:
-            return rivals[0]
-        return self._rotate_pick(rivals, exclude, model, cursor_key="__expiry_ties__")
+            try:
+                remain = float(package.get("remain") or 0)
+                days = float(days)
+            except (TypeError, ValueError):
+                continue
+            if remain <= 0 or days < 0:
+                continue
+            if window > 0 and days > window:
+                continue
+            need += remain / max(days * 24.0, 1.0)
+        return need
 
     def _pick_remaining_first(self, snapshot, exclude, model):
         """剩余估算接近耗尽的 (账号, 模型) 优先接单，或 None（没有可交的）。
