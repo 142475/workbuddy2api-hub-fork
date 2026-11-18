@@ -321,6 +321,28 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 
 本项目仅用于协议学习与个人开发测试，不提供任何商业服务或可用性担保。因使用非官方客户端产生的账号风控、限制或封禁由使用者自行承担，请优先使用官方客户端。
 
+## 十、自建镜像与升级（可选）
+
+上游仓库不可达（被删 / 网络不通）时，用本 fork 的源码在部署机上构建镜像，不依赖任何 registry：
+
+```bash
+git clone https://github.com/142475/workbuddy2api-hub-fork.git
+cd workbuddy2api-hub-fork
+docker build -t workbuddy2api-hub:2.1.8 .
+# 然后把 docker-compose.yml 的 image 改成 workbuddy2api-hub:2.1.8
+docker compose up -d
+```
+
+`Dockerfile` 第一阶段已固定 `ENV GOPROXY=https://goproxy.cn,direct`，在无法直连 `proxy.golang.org` 的网络里也能构建。
+
+**部署机拉不到 GitHub 时**（实测 `git fetch` 会间歇性报 `Connection timed out` / `Encountered end of file`），三条可用路径：
+
+1. 重试：`for i in 1 2 3; do timeout 120 git fetch origin main && break; sleep 3; done && git reset --hard FETCH_HEAD`
+2. 打补丁传：本地 `git format-patch -1 HEAD --stdout | base64 -w0 | ssh host 'base64 -d > /tmp/x.patch'`，远端 `git am /tmp/x.patch`（远端要先配 `user.email` / `user.name`）
+3. 覆盖文件（最稳，不冲突）：本地 `git archive HEAD <改动的文件> | base64 -w0 | ssh host 'base64 -d | tar x -C <仓库目录>'`，远端 `git add` + `git commit`
+
+**升级后必验**：`docker ps` 显示 `Up (healthy)` 且 Image 是新的 tag；`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8788/health` 为 200；`docker exec <容器> grep -c "<本次改动关键字>" /app/<文件>` 非 0（`go:embed` 与镜像层都可能让你误以为代码已更新）。
+
 ## ⭐ Star 趋势
 
 <p align="center">
