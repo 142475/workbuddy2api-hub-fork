@@ -343,6 +343,29 @@ docker compose up -d
 
 **升级后必验**：`docker ps` 显示 `Up (healthy)` 且 Image 是新的 tag；`curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8788/health` 为 200；`docker exec <容器> grep -c "<本次改动关键字>" /app/<文件>` 非 0（`go:embed` 与镜像层都可能让你误以为代码已更新）。
 
+## 十一、积分数据的新鲜度（排障）
+
+面板上的 `remain` / `days_left` 是**上游最后一次成功拉取时的快照**，不是实时值：
+
+| 项 | 行为 |
+|---|---|
+| 刷新线程 | `CreditsRefresher`（`wb_accounts.py`），每 30 分钟醒一次，**每次只刷新最陈旧的那一个号** |
+| 有效期 | `credits_refresh_hours`，默认 12 小时；设为 `≤ 0` 等于关闭刷新 |
+| 跳过的号 | `enabled=false` 的号永不刷新，快照可能是几天前的 |
+| 失败冷却 | 拉取失败的号停 6 小时，避免坏凭证每轮重试 |
+
+实测（2026-11-20）：8788 四个启用号快照 4.4–5.9 小时，8789 三个启用号 9.1–9.2 小时；禁用号分别是 8.7 天和 22.3 天。
+
+**三个容易看错的地方**
+
+1. `days_left` 是快照时刻算出的**相对值**，不能用来判断是否已过期；要拿 `expire_time`（北京时间）和当前时间比。
+2. `soonest_expiring_days()` 只统计 `remain > 0` 且未过期的包，`remain=0` 的临期包会被跳过——面板写着「最近将过期 0.4 天」的号，实际最近有效期可能是 2.9 天。
+3. 顶部「积分剩余」总数含已作废的历史数字（实测该实例禁用号上有 15,308 分实际已过期）。要它准确就清理禁用号，或等号被重新启用、自然刷新一次。
+
+**为什么不放到请求路径上实时拉**：上游 billing 接口是计费调用，每个请求拉一次会把延迟和配额都吃掉；这套选号偏好的单位是「天」，几个小时的漂移不影响 24 小时门槛的判定（实测偏差 0.2–0.4 天，当前账号都远离边界）。
+
+In short: `remain` / `days_left` are the last successful upstream snapshot. `CreditsRefresher` wakes every 30 minutes and refreshes only the single stalest account past a 12-hour TTL; disabled accounts are never refreshed. To tell whether a package has really expired, compare `expire_time` with the current time — never trust `days_left`, and remember `remain = 0` packages are skipped by `soonest_expiring_days()`.
+
 ## ⭐ Star 趋势
 
 <p align="center">
