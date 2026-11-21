@@ -17300,6 +17300,54 @@ def model_scoped_errors_penalize_account():
 # 「本机没网」的指纹：DNS 解析不出来、路由不可达、网卡没起来。这些失败里账号
 # 连一个字节都没发出去，结局却和「上游挂了」长得一样（都是 URLError），所以必须
 # 单独认出来。
+_TRANSPORT_GLITCH_MARKERS = (
+    "unexpected_eof", "eof occurred in violation",
+    "remote end closed connection", "connection reset",
+    "connection aborted", "broken pipe",
+    "timed out", "timeout",
+    "record layer failure", "tlsv1 alert",
+)
+
+
+def _transport_glitch(exc):
+    """这次失败是链路层抖动，还是账号/上游给出的确定答复。
+
+    上游和 CDN 边缘会偶发在建连或读响应时掐掉 TLS —— 现场形状是十几秒后
+    `SSL: UNEXPECTED_EOF_WHILE_READING`。它与账号无关，换一次连接几乎总能拿到
+    正常响应（`wb_accounts.http_json` 早就在重试这条路，只是面板「测试」漏了）。
+    业务失败（HTTPError 4xx/5xx）不算：那是上游明确表过态的答复，重试只会
+    重复同一条结论。
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, BaseException):
+        exc = exc.reason
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError,
+                        socket.timeout, TimeoutError)):
+        return True
+    lowered = str(exc).lower()
+    return any(marker in lowered for marker in _TRANSPORT_GLITCH_MARKERS)
+
+
+def _probe_send(req, account, timeout):
+    """发一次探测请求，链路抖动时原地再试一次。
+
+    返回 `(resp, None)` 或 `(None, 最后一次异常)`：不往外抛，交给 probe_account
+    的统一异常分支去分类（本机断网 / 链路抖动 / 其它答复），三条出口各说各的
+    话，也各自决定要不要给账号记一次失败。
+    """
+    error = None
+    for attempt in (0, 1):
+        try:
+            return wb_accounts.urlopen(req, timeout=timeout, proxy=account.proxy), None
+        except Exception as exc:
+            error = exc
+            if attempt == 0 and _transport_glitch(exc):
+                continue
+            break
+    return None, error
+
+
 LOCAL_NETWORK_MARKERS = (
     "gaierror", "getaddrinfo failed", "name or service not known",
     "nodename nor servname", "temporary failure in name resolution",
@@ -18894,8 +18942,13 @@ def probe_account(account, model=None, timeout=30):
                                  headers=probe_headers)
     req.wb_exact_headers = list(probe_headers.items())
     t0 = time.time()
+    # 链路抖动给一次原地重试：面板「测试」是诊断动作，一次 TLS 被掐就报红会让人
+    # 以为是账号坏了。真实流量那侧 open_upstream 本来就会换号重试，缺的只是这里。
+    resp, send_error = _probe_send(req, account, timeout)
     try:
-        with wb_accounts.urlopen(req, timeout=timeout, proxy=account.proxy) as resp:
+        if send_error is not None:
+            raise send_error
+        with resp:
             chat_obj = aggregate_stream(resp, upstream_model, None)
             row["elapsed_ms"] = int((time.time() - t0) * 1000)
             choices = chat_obj.get("choices") or []
@@ -18955,6 +19008,14 @@ def probe_account(account, model=None, timeout=30):
             # 否则网络一恢复，池子里全是刚才这轮测试留下的冷却账号。
             row["network"] = True
             row["error"] = "本机网络不可用：%s" % exc_detail(exc)
+            account.note_error(row["error"], cooldown=0)
+            return row
+        if _transport_glitch(exc):
+            # 重试过一次还是被掐断：这是出口链路的问题，不是账号的问题。标 network
+            # 让面板说清楚，也不给账号记失败——一次抖动不该让健康的号背上计数。
+            row["network"] = True
+            row["error"] = "%s不稳定：%s" % (
+                "代理出口链路" if account.proxy else "上游链路", exc_detail(exc))
             account.note_error(row["error"], cooldown=0)
             return row
         row["error"] = "%s: %s" % (type(exc).__name__, exc)
